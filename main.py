@@ -32,6 +32,7 @@ class StepObject:
         self.function = function
         self.control = control
         self.params = {}
+        self.outputs = {}
 
 
 class DraggableTreeWidget(QTreeWidget):
@@ -100,8 +101,13 @@ class DroppableListWidget(QListWidget):
             func_name = bytes(data_stream.readString()).decode('utf-8')
             module_name = bytes(data_stream.readString()).decode('utf-8')
             
-            item = QListWidgetItem(f"{module_name}.{func_name}")
-            step = StepObject(type_="function", module=module_name, function=func_name)
+            # If the item came from the special control category, create a control step
+            if module_name == "流程控制":
+                item = QListWidgetItem(func_name)
+                step = StepObject(type_="control", control=func_name)
+            else:
+                item = QListWidgetItem(f"{module_name}.{func_name}")
+                step = StepObject(type_="function", module=module_name, function=func_name)
             item.setData(Qt.ItemDataRole.UserRole, step)
             item.setData(Qt.ItemDataRole.UserRole + 1, step.id)  # 唯一ID
             self.addItem(item)
@@ -137,24 +143,7 @@ class ControlWidget(QWidget):
     def init_ui(self):
         layout = QHBoxLayout(self)
         
-        self.if_button = QPushButton("If")
-        self.for_button = QPushButton("For")
-        self.end_button = QPushButton("End")
-        
-        # 设置可拖拽
-        self.if_button.setMouseTracking(True)
-        self.for_button.setMouseTracking(True)
-        self.end_button.setMouseTracking(True)
-        
-        layout.addWidget(self.if_button)
-        layout.addWidget(self.for_button)
-        layout.addWidget(self.end_button)
-        
-        # 连接信号
-        self.if_button.pressed.connect(lambda: self.start_drag("if"))
-        self.for_button.pressed.connect(lambda: self.start_drag("for"))
-        self.end_button.pressed.connect(lambda: self.start_drag("end"))
-        
+
     def start_drag(self, text):
         drag = QDrag(self)
         mime_data = QMimeData()
@@ -363,7 +352,29 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 self.add_input_row("error", f"解析失败: {str(e)}", read_only=True)
         else:
-            self.output_params_label.setText("-")
+            # control item: show appropriate param inputs
+            if isinstance(data, StepObject):
+                control_type = data.control
+            else:
+                control_type = data.get("control")
+
+            if control_type == "if":
+                # condition expression, can reference other steps via ${#N:key} or loop vars via ${@var}
+                cond = data.params.get("condition", "") if isinstance(data, StepObject) else self.step_params_cache.get(item_id, {}).get("condition", "")
+                edit = self.add_input_row("condition", cond)
+                if isinstance(data, StepObject):
+                    edit.textChanged.connect(lambda val, it=current: self.on_param_changed(it, "condition", val))
+            elif control_type == "for":
+                iterable = data.params.get("iterable", "") if isinstance(data, StepObject) else self.step_params_cache.get(item_id, {}).get("iterable", "")
+                varname = data.params.get("var", "_loop") if isinstance(data, StepObject) else self.step_params_cache.get(item_id, {}).get("var", "_loop")
+                edit1 = self.add_input_row("iterable", iterable)
+                edit2 = self.add_input_row("var", varname)
+                if isinstance(data, StepObject):
+                    edit1.textChanged.connect(lambda val, it=current: self.on_param_changed(it, "iterable", val))
+                    edit2.textChanged.connect(lambda val, it=current: self.on_param_changed(it, "var", val))
+            else:
+                # end or unknown control
+                self.output_params_label.setText("-")
 
     def load_test_functions(self):
         """加载当前目录下的测试函数"""
@@ -401,6 +412,14 @@ class MainWindow(QMainWindow):
                     print(f"无法加载模块 {module_name}: {e}")
         
         self.function_tree.expandAll()
+
+        # 添加流程控制分类（可拖拽到序列中作为控制节点）
+        control_item = QTreeWidgetItem(["流程控制"])
+        for ctrl in ["if", "for", "end", "break"]:
+            child = QTreeWidgetItem([ctrl])
+            control_item.addChild(child)
+        self.function_tree.addTopLevelItem(control_item)
+        self.function_tree.expandItem(control_item)
         
     def clear_sequence(self):
         """清空测试序列"""
@@ -421,101 +440,176 @@ class MainWindow(QMainWindow):
         self.output_text.setText(output)
         QApplication.processEvents()  # 更新界面
 
-        try:
-            # 执行序列中的每一项
-            for i in range(self.sequence_list.count()):
+        def safe_eval(expr, local_vars=None):
+            if local_vars is None:
+                local_vars = {}
+            try:
+                import ast
+                return ast.literal_eval(expr)
+            except Exception:
+                try:
+                    safe_globals = {"__builtins__": None, 'True': True, 'False': False, 'None': None}
+                    return eval(expr, safe_globals, local_vars)
+                except Exception:
+                    return False
+
+        def run_block(start_idx, end_idx, runtime_vars):
+            """Execute items from start_idx to end_idx inclusive using runtime_vars for ${@var} replacements."""
+            nonlocal output
+            i = start_idx
+            while i <= end_idx:
                 item = self.sequence_list.item(i)
                 step_data = item.data(Qt.ItemDataRole.UserRole)
 
-                # Determine whether this is a function step or control step
-                is_function = False
-                func = None
-                module_name = None
-                func_name = None
+                # Determine control or function
                 if isinstance(step_data, StepObject):
-                    if step_data.type == "function":
-                        is_function = True
+                    if step_data.type == 'control':
+                        ctrl = step_data.control
+                    else:
+                        ctrl = None
+                else:
+                    ctrl = step_data.get('control') if isinstance(step_data, dict) else None
+
+                if ctrl == 'if':
+                    # find matching end
+                    match = self.find_matching_end(i)
+                    cond_raw = step_data.params.get('condition', '') if isinstance(step_data, StepObject) else self.step_params_cache.get(item.data(Qt.ItemDataRole.UserRole + 1), {}).get('condition', '')
+                    cond_val = self.resolve_references(cond_raw, runtime_vars)
+                    # evaluate boolean
+                    cond_bool = cond_val if isinstance(cond_val, bool) else safe_eval(str(cond_val), runtime_vars)
+                    output += f"IF condition ({cond_raw}) -> {cond_bool}\n"
+                    self.output_text.setText(output)
+                    QApplication.processEvents()
+                    if cond_bool:
+                        # execute block inside
+                        if match != -1 and match > i:
+                            run_block(i+1, match-1, runtime_vars)
+                            i = match + 1
+                            continue
+                        else:
+                            i += 1
+                            continue
+                    else:
+                        # skip to end
+                        i = match + 1 if match != -1 else i + 1
+                        continue
+                elif ctrl == 'for':
+                    match = self.find_matching_end(i)
+                    iterable_raw = step_data.params.get('iterable', '') if isinstance(step_data, StepObject) else self.step_params_cache.get(item.data(Qt.ItemDataRole.UserRole + 1), {}).get('iterable', '')
+                    varname = step_data.params.get('var', '_loop') if isinstance(step_data, StepObject) else self.step_params_cache.get(item.data(Qt.ItemDataRole.UserRole + 1), {}).get('var', '_loop')
+                    iterable_val = self.resolve_references(iterable_raw, runtime_vars)
+                    # normalize iterable
+                    if isinstance(iterable_val, int):
+                        iterator = range(iterable_val)
+                    elif isinstance(iterable_val, (list, tuple)):
+                        iterator = iterable_val
+                    else:
+                        # try to eval as python expression
+                        try:
+                            iterator = list(safe_eval(str(iterable_val), runtime_vars))
+                        except Exception:
+                            iterator = []
+
+                    output += f"FOR over {iterable_raw} -> {list(iterator)}\n"
+                    self.output_text.setText(output)
+                    QApplication.processEvents()
+                    if match != -1 and match > i:
+                        for val in iterator:
+                            new_vars = dict(runtime_vars)
+                            new_vars[varname] = val
+                            run_block(i+1, match-1, new_vars)
+                        i = match + 1
+                        continue
+                    else:
+                        i += 1
+                        continue
+                elif ctrl == 'end':
+                    # should be handled by find_matching_end logic; just advance
+                    i += 1
+                    continue
+
+                # else, it's a function step
+                # prepare and call function
+                if isinstance(step_data, StepObject):
+                    if step_data.type == 'function':
                         module_name = step_data.module
                         func_name = step_data.function
                         func = self.test_functions.get(module_name, {}).get(func_name)
                     else:
-                        # control
-                        output += f"控制语句: {step_data.control}\n"
-                        self.output_text.setText(output)
-                        QApplication.processEvents()
-                        continue
+                        func = None
                 else:
-                    # legacy dict-based storage
-                    if step_data.get("type") == "function":
-                        is_function = True
-                        module_name = step_data.get("module")
-                        func_name = step_data.get("function")
+                    if isinstance(step_data, dict) and step_data.get('type') == 'function':
+                        module_name = step_data.get('module')
+                        func_name = step_data.get('function')
                         func = self.test_functions.get(module_name, {}).get(func_name)
-                    elif step_data.get("type") == "control":
-                        output += f"控制语句: {step_data.get('control')}\n"
-                        self.output_text.setText(output)
-                        QApplication.processEvents()
-                        continue
+                    else:
+                        func = None
 
-                if is_function:
-                    output += f"执行: {module_name}.{func_name}... "
+                if func is None:
+                    output += f"跳过未知步骤或控制: {item.text()}\n"
                     self.output_text.setText(output)
                     QApplication.processEvents()
+                    i += 1
+                    continue
 
-                    if func is None:
-                        output += "函数未找到\n"
-                        self.output_text.setText(output)
-                        continue
-
-                    # 获取函数签名，准备参数
-                    import inspect
-                    sig = inspect.signature(func)
-                    params = sig.parameters
-                    args = {}
-
-                    # 从 step_data 或当前输入框提取参数值，并做类型转换
-                    for param_name in params.keys():
-                        if isinstance(step_data, StepObject):
-                            value_str = step_data.params.get(param_name, '').strip()
-                        else:
-                            if param_name in self.current_param_widgets:
-                                widget = self.current_param_widgets[param_name]
-                                value_str = widget.text().strip()
-                            else:
-                                value_str = ''
-
-                        # 类型转换
-                        param_type = params[param_name].annotation
-                        if param_type != inspect.Parameter.empty:
-                            try:
-                                if param_type == bool:
-                                    value = value_str.lower() in ('true', '1', 'yes', 'on')
-                                elif param_type in (int, float):
-                                    value = param_type(value_str)
-                                else:
-                                    value = value_str  # 默认作为字符串
-                            except Exception as e:
-                                output += f"参数 '{param_name}' 类型转换失败: {e}\n"
-                                self.output_text.setText(output)
-                                QApplication.processEvents()
-                                continue
-                        else:
-                            value = value_str  # 无类型注解时作为字符串
-                        args[param_name] = value
-
-                    # 调用函数
-                    try:
-                        result = func(**args)
-                        output += f"{'成功' if result is None or result else '失败'}\n"
-                    except Exception as e:
-                        output += f"错误: {str(e)}\n"
-                    
+                output += f"执行: {module_name}.{func_name}... "
                 self.output_text.setText(output)
                 QApplication.processEvents()
-                
+
+                import inspect
+                sig = inspect.signature(func)
+                params = sig.parameters
+                args = {}
+
+                for param_name in params.keys():
+                    # get raw value string from step params or current widgets
+                    if isinstance(step_data, StepObject):
+                        raw = step_data.params.get(param_name, '')
+                    else:
+                        raw = self.step_params_cache.get(item.data(Qt.ItemDataRole.UserRole + 1), {}).get(param_name, '')
+
+                    # resolve references
+                    resolved = self.resolve_references(raw, runtime_vars)
+
+                    # type conversion
+                    param_type = params[param_name].annotation
+                    if param_type != inspect.Parameter.empty:
+                        try:
+                            if param_type == bool:
+                                value = bool(resolved) if isinstance(resolved, bool) else str(resolved).lower() in ('true', '1', 'yes', 'on')
+                            elif param_type in (int, float):
+                                value = param_type(resolved)
+                            else:
+                                value = resolved
+                        except Exception as e:
+                            output += f"参数 '{param_name}' 类型转换失败: {e}\n"
+                            self.output_text.setText(output)
+                            QApplication.processEvents()
+                            value = resolved
+                    else:
+                        value = resolved
+                    args[param_name] = value
+
+                try:
+                    result = func(**args)
+                    # store outputs
+                    if isinstance(step_data, StepObject):
+                        if isinstance(result, dict):
+                            step_data.outputs.update(result)
+                        else:
+                            step_data.outputs['return'] = result
+                    output += f"{'成功' if result is None or result else '失败'}\n"
+                except Exception as e:
+                    output += f"错误: {str(e)}\n"
+
+                self.output_text.setText(output)
+                QApplication.processEvents()
+                i += 1
+
+        try:
+            run_block(0, self.sequence_list.count()-1, {})
             output += "测试序列执行完成。\n"
             self.output_text.setText(output)
-            
         except Exception as e:
             output += f"执行过程中发生错误: {str(e)}\n"
             self.output_text.setText(output)
@@ -585,6 +679,82 @@ class MainWindow(QMainWindow):
         data = item.data(Qt.ItemDataRole.UserRole)
         if isinstance(data, StepObject):
             data.params[param_name] = value
+
+    def resolve_references(self, text, runtime_vars=None):
+        """Resolve reference patterns in text.
+
+        Supported patterns:
+          ${#N:key}   -> value of step N (1-based) output 'key' or param 'key'
+          ${@var}     -> runtime var (e.g., loop var)
+
+        If text isn't a string with references, return it unchanged.
+        """
+        if runtime_vars is None:
+            runtime_vars = {}
+
+        if not isinstance(text, str):
+            return text
+
+        import re
+
+        def repl_step(m):
+            idx = int(m.group(1)) - 1
+            key = m.group(2)
+            if 0 <= idx < self.sequence_list.count():
+                item = self.sequence_list.item(idx)
+                data = item.data(Qt.ItemDataRole.UserRole)
+                # prefer outputs then params
+                if isinstance(data, StepObject):
+                    if key in data.outputs:
+                        return str(data.outputs.get(key))
+                    return str(data.params.get(key, ""))
+                else:
+                    cache = self.step_params_cache.get(item.data(Qt.ItemDataRole.UserRole + 1), {})
+                    return str(cache.get(key, ""))
+            return ""
+
+        def repl_var(m):
+            name = m.group(1)
+            return str(runtime_vars.get(name, ""))
+
+        # replace ${#N:key}
+        text2 = re.sub(r"\$\{#(\d+):([^}]+)\}", repl_step, text)
+        # replace ${@var}
+        text3 = re.sub(r"\$\{@([^}]+)\}", repl_var, text2)
+
+        # Try to interpret as literal (number, list) if possible
+        try:
+            import ast
+            val = ast.literal_eval(text3)
+            return val
+        except Exception:
+            pass
+
+        return text3
+
+    def find_matching_end(self, start_index):
+        """Find the matching 'end' index for a control starting at start_index.
+
+        Accounts for nested controls.
+        Returns index of the matching end, or -1 if not found.
+        """
+        depth = 0
+        for i in range(start_index, self.sequence_list.count()):
+            item = self.sequence_list.item(i)
+            data = item.data(Qt.ItemDataRole.UserRole)
+            ctrl = None
+            if isinstance(data, StepObject) and data.type == "control":
+                ctrl = data.control
+            elif isinstance(data, dict) and data.get("type") == "control":
+                ctrl = data.get("control")
+
+            if ctrl in ("if", "for"):
+                depth += 1
+            elif ctrl == "end":
+                depth -= 1
+                if depth == 0:
+                    return i
+        return -1
 
 def main():
     app = QApplication(sys.argv)
