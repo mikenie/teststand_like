@@ -221,54 +221,84 @@ class MainWindow(QMainWindow):
         self.control_widget = ControlWidget()
         left_layout.addWidget(self.control_widget)
         
-        # 右侧区域
+        # 右侧区域（包含序列区和监视器，使用内部水平分割）
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
-        
-        # 测试序列列表
-        self.sequence_list = DroppableListWidget()
-        right_layout.addWidget(self.sequence_list)
-        
-        # 按钮区域
-        button_layout = QHBoxLayout()
+
+        # 创建序列区域（左）和监视器区域（右）的分割器
+        seq_watcher_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # --- 序列区域（包含序列列表、控制按钮、步骤设置和输出）
+        seq_area = QWidget()
+        seq_layout = QVBoxLayout(seq_area)
+
+        # 控制按钮栏（放在序列的左上角）
+        control_bar = QHBoxLayout()
         self.load_button = QPushButton("加载测试函数")
         self.run_button = QPushButton("运行测试序列")
+        self.step_button = QPushButton("单步运行")
+        self.reset_exec_button = QPushButton("重置执行")
         self.clear_button = QPushButton("清空序列")
-        
-        button_layout.addWidget(self.load_button)
-        button_layout.addWidget(self.run_button)
-        button_layout.addWidget(self.clear_button)
-        
-        right_layout.addLayout(button_layout)
-        
+
+        control_bar.addWidget(self.load_button)
+        control_bar.addWidget(self.run_button)
+        control_bar.addWidget(self.step_button)
+        control_bar.addWidget(self.reset_exec_button)
+        control_bar.addWidget(self.clear_button)
+
+        seq_layout.addLayout(control_bar)
+
+        # 测试序列列表
+        self.sequence_list = DroppableListWidget()
+        seq_layout.addWidget(self.sequence_list)
+
         # --- 步骤设置区域 ---
         self.step_config_group = QWidget()
         step_layout = QVBoxLayout(self.step_config_group)
         step_layout.setContentsMargins(5, 5, 5, 5)
-        
+
         self.current_param_widgets = {}  # 缓存当前参数控件
-        
+
         step_layout.addWidget(QLabel("<b>步骤设置</b>"))
-        
+
         # 输入参数区
         self.input_params_layout = QVBoxLayout()
         self.input_params_widget = QWidget()
         self.input_params_widget.setLayout(self.input_params_layout)
         step_layout.addWidget(QLabel("输入参数:"))
         step_layout.addWidget(self.input_params_widget)
-        
+
         # 输出参数区
         self.output_params_label = QLabel("-")
         self.output_params_label.setStyleSheet("QLabel { background-color: #f0f0f0; padding: 5px; border: 1px solid #ccc; }")
         step_layout.addWidget(QLabel("输出参数:"))
         step_layout.addWidget(self.output_params_label)
-        
-        right_layout.addWidget(self.step_config_group)
-        
+
+        seq_layout.addWidget(self.step_config_group)
+
         # 输出区域
         self.output_text = QTextEdit()
         self.output_text.setReadOnly(True)
-        right_layout.addWidget(self.output_text)
+        seq_layout.addWidget(self.output_text)
+
+        seq_watcher_splitter.addWidget(seq_area)
+
+        # --- 监视器区域（右侧） ---
+        watcher_widget = QWidget()
+        watcher_layout = QVBoxLayout(watcher_widget)
+        watcher_layout.setContentsMargins(5, 5, 5, 5)
+        watcher_layout.addWidget(QLabel("变量监视器"))
+        from PyQt6.QtWidgets import QTreeWidget, QTreeWidgetItem
+        self.watcher_tree = QTreeWidget()
+        self.watcher_tree.setHeaderLabel("变量")
+        watcher_layout.addWidget(self.watcher_tree)
+
+        seq_watcher_splitter.addWidget(watcher_widget)
+
+        # 调整默认大小比例
+        seq_watcher_splitter.setSizes([700, 300])
+
+        right_layout.addWidget(seq_watcher_splitter)
         
         # 添加到分割器
         main_splitter.addWidget(left_widget)
@@ -278,6 +308,8 @@ class MainWindow(QMainWindow):
         # 连接信号
         self.load_button.clicked.connect(self.load_test_functions)
         self.run_button.clicked.connect(self.run_sequence)
+        self.step_button.clicked.connect(self.step_run)
+        self.reset_exec_button.clicked.connect(self.reset_executor)
         self.clear_button.clicked.connect(self.clear_sequence)
         self.sequence_list.itemMoved.connect(self.update_output)
         # 使用 currentItemChanged 来获取上一个选中项（previous）以便在切换时保存它的参数
@@ -433,6 +465,254 @@ class MainWindow(QMainWindow):
             item = self.sequence_list.item(i)
             sequence_text += f"{i+1}. {item.text()}\n"
         self.output_text.setText(sequence_text)
+
+    # Executor helpers and state for step execution
+    def _safe_eval(self, expr, local_vars=None):
+        if local_vars is None:
+            local_vars = {}
+        try:
+            import ast
+            return ast.literal_eval(expr)
+        except Exception:
+            try:
+                safe_globals = {"__builtins__": None, 'True': True, 'False': False, 'None': None}
+                return eval(expr, safe_globals, local_vars)
+            except Exception:
+                return False
+
+    def _run_block(self, start_idx, end_idx, runtime_vars, max_actions=None):
+        """Execute items from start_idx..end_idx. If max_actions is set, stop after that many actions (control evaluations or function calls).
+
+        Returns (new_index, runtime_vars, actions_done)
+        """
+        actions = 0
+        i = start_idx
+        while i <= end_idx:
+            item = self.sequence_list.item(i)
+            step_data = item.data(Qt.ItemDataRole.UserRole)
+
+            # Determine control or function
+            if isinstance(step_data, StepObject):
+                if step_data.type == 'control':
+                    ctrl = step_data.control
+                else:
+                    ctrl = None
+            else:
+                ctrl = step_data.get('control') if isinstance(step_data, dict) else None
+
+            if ctrl == 'if':
+                match = self.find_matching_end(i)
+                cond_raw = step_data.params.get('condition', '') if isinstance(step_data, StepObject) else self.step_params_cache.get(item.data(Qt.ItemDataRole.UserRole + 1), {}).get('condition', '')
+                cond_val = self.resolve_references(cond_raw, runtime_vars)
+                cond_bool = cond_val if isinstance(cond_val, bool) else self._safe_eval(str(cond_val), runtime_vars)
+                self.output_text.append(f"IF condition ({cond_raw}) -> {cond_bool}")
+                self.update_watcher(runtime_vars)
+                actions += 1
+                if max_actions is not None and actions >= max_actions:
+                    return (i+1, runtime_vars, actions)
+                if cond_bool:
+                    if match != -1 and match > i:
+                        ni, nv, a = self._run_block(i+1, match-1, runtime_vars, None if max_actions is None else (max_actions - actions))
+                        actions += a
+                        runtime_vars = nv
+                        i = match + 1
+                        if max_actions is not None and actions >= max_actions:
+                            return (i, runtime_vars, actions)
+                        continue
+                    else:
+                        i += 1
+                        continue
+                else:
+                    i = match + 1 if match != -1 else i + 1
+                    continue
+            elif ctrl == 'for':
+                match = self.find_matching_end(i)
+                iterable_raw = step_data.params.get('iterable', '') if isinstance(step_data, StepObject) else self.step_params_cache.get(item.data(Qt.ItemDataRole.UserRole + 1), {}).get('iterable', '')
+                varname = step_data.params.get('var', '_loop') if isinstance(step_data, StepObject) else self.step_params_cache.get(item.data(Qt.ItemDataRole.UserRole + 1), {}).get('var', '_loop')
+                iterable_val = self.resolve_references(iterable_raw, runtime_vars)
+                if isinstance(iterable_val, int):
+                    iterator = range(iterable_val)
+                elif isinstance(iterable_val, (list, tuple)):
+                    iterator = iterable_val
+                else:
+                    try:
+                        iterator = list(self._safe_eval(str(iterable_val), runtime_vars))
+                    except Exception:
+                        iterator = []
+
+                self.output_text.append(f"FOR over {iterable_raw} -> {list(iterator)}")
+                self.update_watcher(runtime_vars)
+                actions += 1
+                if max_actions is not None and actions >= max_actions:
+                    return (i+1, runtime_vars, actions)
+                if match != -1 and match > i:
+                    for val in iterator:
+                        new_vars = dict(runtime_vars)
+                        new_vars[varname] = val
+                        ni, nv, a = self._run_block(i+1, match-1, new_vars, None if max_actions is None else (max_actions - actions))
+                        actions += a
+                        if max_actions is not None and actions >= max_actions:
+                            # compute where to resume: if we stopped inside inner block, set index accordingly
+                            return (i, nv, actions)
+                    i = match + 1
+                    continue
+                else:
+                    i += 1
+                    continue
+            elif ctrl == 'end':
+                i += 1
+                continue
+
+            # function step
+            if isinstance(step_data, StepObject):
+                if step_data.type == 'function':
+                    module_name = step_data.module
+                    func_name = step_data.function
+                    func = self.test_functions.get(module_name, {}).get(func_name)
+                else:
+                    func = None
+            else:
+                if isinstance(step_data, dict) and step_data.get('type') == 'function':
+                    module_name = step_data.get('module')
+                    func_name = step_data.get('function')
+                    func = self.test_functions.get(module_name, {}).get(func_name)
+                else:
+                    func = None
+
+            if func is None:
+                self.output_text.append(f"跳过未知步骤或控制: {item.text()}")
+                self.update_watcher(runtime_vars)
+                i += 1
+                continue
+
+            self.output_text.append(f"执行: {module_name}.{func_name}...")
+            self.update_watcher(runtime_vars)
+
+            import inspect
+            sig = inspect.signature(func)
+            params = sig.parameters
+            args = {}
+
+            for param_name in params.keys():
+                if isinstance(step_data, StepObject):
+                    raw = step_data.params.get(param_name, '')
+                else:
+                    raw = self.step_params_cache.get(item.data(Qt.ItemDataRole.UserRole + 1), {}).get(param_name, '')
+                resolved = self.resolve_references(raw, runtime_vars)
+                param_type = params[param_name].annotation
+                if param_type != inspect.Parameter.empty:
+                    try:
+                        if param_type == bool:
+                            value = bool(resolved) if isinstance(resolved, bool) else str(resolved).lower() in ('true', '1', 'yes', 'on')
+                        elif param_type in (int, float):
+                            value = param_type(resolved)
+                        else:
+                            value = resolved
+                    except Exception as e:
+                        self.output_text.append(f"参数 '{param_name}' 类型转换失败: {e}")
+                        value = resolved
+                else:
+                    value = resolved
+                args[param_name] = value
+
+            try:
+                result = func(**args)
+                if isinstance(step_data, StepObject):
+                    if isinstance(result, dict):
+                        step_data.outputs.update(result)
+                    else:
+                        step_data.outputs['return'] = result
+                self.output_text.append(f"{'成功' if result is None or result else '失败'}")
+            except Exception as e:
+                self.output_text.append(f"错误: {str(e)}")
+
+            self.update_watcher(runtime_vars)
+            actions += 1
+            if max_actions is not None and actions >= max_actions:
+                return (i+1, runtime_vars, actions)
+            i += 1
+
+        return (i, runtime_vars, actions)
+
+    def step_run(self):
+        """Execute a single action (control evaluation or a function call)."""
+        if not hasattr(self, 'exec_state') or self.exec_state is None:
+            # initialize
+            self.exec_state = {'index': 0, 'vars': {}}
+        start = self.exec_state['index']
+        end = self.sequence_list.count() - 1
+        if start > end:
+            self.output_text.append("已到序列末尾；请重置执行以重新开始。")
+            return
+        ni, nv, a = self._run_block(start, end, dict(self.exec_state['vars']), max_actions=1)
+        self.exec_state['index'] = ni
+        self.exec_state['vars'] = nv
+        self.output_text.append(f"单步执行: 完成 {a} 个操作，下一索引 {ni}")
+
+    def reset_executor(self):
+        self.exec_state = {'index': 0, 'vars': {}}
+        self.output_text.append("执行状态已重置")
+        self.update_watcher({})
+
+    def update_watcher(self, runtime_vars):
+        """Refresh the watcher tree showing variables organized by sequence steps."""
+        self.watcher_tree.clear()
+        
+        # Show variables organized by sequence steps
+        for i in range(self.sequence_list.count()):
+            it = self.sequence_list.item(i)
+            data = it.data(Qt.ItemDataRole.UserRole)
+            
+            if not isinstance(data, StepObject):
+                continue
+                
+            # Create a top-level node for this step
+            step_node = QTreeWidgetItem([f"步骤 {i+1}: {it.text()}"])
+            
+            if data.type == 'function':
+                # Function steps show both inputs and outputs
+                inputs_node = QTreeWidgetItem(["输入参数"])
+                for k, v in data.params.items():
+                    inputs_node.addChild(QTreeWidgetItem([f"{k}: {v}"]))
+                step_node.addChild(inputs_node)
+                
+                outputs_node = QTreeWidgetItem(["输出结果"])
+                for k, v in data.outputs.items():
+                    outputs_node.addChild(QTreeWidgetItem([f"{k}: {v}"]))
+                step_node.addChild(outputs_node)
+                
+            elif data.type == 'control':
+                # Control steps show their specific parameters
+                if data.control == 'if':
+                    ctrl_node = QTreeWidgetItem(["条件"])
+                    condition = data.params.get('condition', '')
+                    ctrl_node.addChild(QTreeWidgetItem([f"表达式: {condition}"]))
+                    step_node.addChild(ctrl_node)
+                    
+                elif data.control == 'for':
+                    ctrl_node = QTreeWidgetItem(["循环"])
+                    iterable = data.params.get('iterable', '')
+                    varname = data.params.get('var', '_loop')
+                    ctrl_node.addChild(QTreeWidgetItem([f"迭代对象: {iterable}"]))
+                    ctrl_node.addChild(QTreeWidgetItem([f"循环变量: {varname}"]))
+                    step_node.addChild(ctrl_node)
+                    
+            self.watcher_tree.addTopLevelItem(step_node)
+        
+        # Runtime Variables (e.g., loop variables)
+        if runtime_vars:
+            runtime_node = QTreeWidgetItem(["运行时变量"])
+            for k, v in runtime_vars.items():
+                runtime_node.addChild(QTreeWidgetItem([f"{k}: {v}"]))
+            self.watcher_tree.addTopLevelItem(runtime_node)
+            
+        # Global Variables
+        gvars = getattr(self, 'global_vars', {})
+        if gvars:
+            globals_node = QTreeWidgetItem(["全局变量"])
+            for k, v in gvars.items():
+                globals_node.addChild(QTreeWidgetItem([f"{k}: {v}"]))
+            self.watcher_tree.addTopLevelItem(globals_node)
         
     def run_sequence(self):
         """运行测试序列"""
