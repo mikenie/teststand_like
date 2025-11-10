@@ -412,6 +412,8 @@ class MainWindow(QMainWindow):
         """加载当前目录下的测试函数"""
         self.function_tree.clear()
         self.test_functions = {}
+        # reset parsed return names
+        self.func_return_names = {}
         
         # 查找当前目录下的Python文件
         current_dir = os.getcwd()
@@ -422,6 +424,33 @@ class MainWindow(QMainWindow):
                     spec = importlib.util.spec_from_file_location(module_name, file)
                     module = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(module)
+                    # attempt to parse source to find return variable names or dict keys
+                    try:
+                        src = open(file, 'r', encoding='utf-8').read()
+                        import ast
+                        tree = ast.parse(src)
+                        func_returns = {}
+                        for node in tree.body:
+                            if isinstance(node, ast.FunctionDef):
+                                ret_names = []
+                                for st in ast.walk(node):
+                                    if isinstance(st, ast.Return) and st.value is not None:
+                                        v = st.value
+                                        # return of a simple name: return sum
+                                        if isinstance(v, ast.Name):
+                                            ret_names.append(v.id)
+                                        # return of a dict literal: return {'k': val}
+                                        elif isinstance(v, ast.Dict):
+                                            for key in v.keys:
+                                                if isinstance(key, ast.Constant):
+                                                    ret_names.append(str(key.value))
+                                if ret_names:
+                                    func_returns[node.name] = list(dict.fromkeys(ret_names))
+                        if func_returns:
+                            self.func_return_names[module_name] = func_returns
+                    except Exception:
+                        # ignore parsing errors
+                        pass
                     
                     # 获取模块中的函数
                     functions = []
@@ -455,8 +484,28 @@ class MainWindow(QMainWindow):
         
     def clear_sequence(self):
         """清空测试序列"""
+        # first clear stored params/outputs on each step object
+        for i in range(self.sequence_list.count()):
+            it = self.sequence_list.item(i)
+            data = it.data(Qt.ItemDataRole.UserRole)
+            if isinstance(data, StepObject):
+                data.params.clear()
+                data.outputs.clear()
+
+        # clear the visual list and caches
         self.sequence_list.clear()
+        self.step_params_cache.clear()
+        # reset execution state and clear any markers
+        self.exec_state = None
+        try:
+            self.mark_exec_index(None)
+        except Exception:
+            pass
+
+        # clear watcher and output
         self.update_output()
+        self.update_watcher({})
+        self.output_text.clear()
         
     def update_output(self):
         """更新输出显示"""
@@ -621,7 +670,21 @@ class MainWindow(QMainWindow):
                     if isinstance(result, dict):
                         step_data.outputs.update(result)
                     else:
+                        # store generic return and also map to any param name whose passed value equals the return
                         step_data.outputs['return'] = result
+                        try:
+                            for pn, pv in args.items():
+                                # simple equality check to map common pattern where function returns an input value
+                                if pv == result:
+                                    step_data.outputs[pn] = result
+                                # also map any predicted return names (parsed from source) to the returned value
+                                preds = self.func_return_names.get(step_data.module, {}).get(step_data.function, [])
+                                for pred in preds:
+                                    if pred not in step_data.outputs:
+                                        step_data.outputs[pred] = result
+                        except Exception:
+                            # don't break execution on mapping issues
+                            pass
                 self.output_text.append(f"{'成功' if result is None or result else '失败'}")
             except Exception as e:
                 self.output_text.append(f"错误: {str(e)}")
@@ -644,14 +707,23 @@ class MainWindow(QMainWindow):
         if start > end:
             self.output_text.append("已到序列末尾；请重置执行以重新开始。")
             return
+        # show marker at current position before executing
+        self.mark_exec_index(start)
         ni, nv, a = self._run_block(start, end, dict(self.exec_state['vars']), max_actions=1)
         self.exec_state['index'] = ni
         self.exec_state['vars'] = nv
+        # update marker to new position (or clear if finished)
+        if self.exec_state['index'] <= end:
+            self.mark_exec_index(self.exec_state['index'])
+        else:
+            self.mark_exec_index(None)
         self.output_text.append(f"单步执行: 完成 {a} 个操作，下一索引 {ni}")
 
     def reset_executor(self):
         self.exec_state = {'index': 0, 'vars': {}}
         self.output_text.append("执行状态已重置")
+        # clear or set marker to start
+        self.mark_exec_index(self.exec_state['index'])
         self.update_watcher({})
 
     def update_watcher(self, runtime_vars):
@@ -698,7 +770,7 @@ class MainWindow(QMainWindow):
                     step_node.addChild(ctrl_node)
                     
             self.watcher_tree.addTopLevelItem(step_node)
-        
+
         # Runtime Variables (e.g., loop variables)
         if runtime_vars:
             runtime_node = QTreeWidgetItem(["运行时变量"])
@@ -713,6 +785,30 @@ class MainWindow(QMainWindow):
             for k, v in gvars.items():
                 globals_node.addChild(QTreeWidgetItem([f"{k}: {v}"]))
             self.watcher_tree.addTopLevelItem(globals_node)
+        
+    def mark_exec_index(self, idx):
+        """Visually mark the execution index in the sequence list by appending an arrow to the item's text.
+
+        Args:
+            idx (int|None): index to mark, or None to clear all markers.
+        """
+        for i in range(self.sequence_list.count()):
+            item = self.sequence_list.item(i)
+            data = item.data(Qt.ItemDataRole.UserRole)
+            # compute base label from StepObject when possible to avoid accumulating arrows
+            if isinstance(data, StepObject):
+                if data.type == 'function':
+                    base = f"{data.module}.{data.function}"
+                else:
+                    base = data.control
+            else:
+                # fallback: remove any previous arrow suffix
+                base = item.text().split('  ')[0]
+
+            if idx is not None and i == idx:
+                item.setText(f"{base}  <-")
+            else:
+                item.setText(base)
         
     def run_sequence(self):
         """运行测试序列"""
@@ -736,6 +832,11 @@ class MainWindow(QMainWindow):
         def run_block(start_idx, end_idx, runtime_vars):
             """Execute items from start_idx to end_idx inclusive using runtime_vars for ${@var} replacements."""
             nonlocal output
+            # update watcher at the start of block
+            try:
+                self.update_watcher(runtime_vars)
+            except Exception:
+                pass
             i = start_idx
             while i <= end_idx:
                 item = self.sequence_list.item(i)
@@ -759,6 +860,11 @@ class MainWindow(QMainWindow):
                     cond_bool = cond_val if isinstance(cond_val, bool) else safe_eval(str(cond_val), runtime_vars)
                     output += f"IF condition ({cond_raw}) -> {cond_bool}\n"
                     self.output_text.setText(output)
+                    # update watcher after evaluating condition
+                    try:
+                        self.update_watcher(runtime_vars)
+                    except Exception:
+                        pass
                     QApplication.processEvents()
                     if cond_bool:
                         # execute block inside
@@ -792,6 +898,11 @@ class MainWindow(QMainWindow):
 
                     output += f"FOR over {iterable_raw} -> {list(iterator)}\n"
                     self.output_text.setText(output)
+                    # update watcher after preparing iterator
+                    try:
+                        self.update_watcher(runtime_vars)
+                    except Exception:
+                        pass
                     QApplication.processEvents()
                     if match != -1 and match > i:
                         for val in iterator:
@@ -828,6 +939,10 @@ class MainWindow(QMainWindow):
                 if func is None:
                     output += f"跳过未知步骤或控制: {item.text()}\n"
                     self.output_text.setText(output)
+                    try:
+                        self.update_watcher(runtime_vars)
+                    except Exception:
+                        pass
                     QApplication.processEvents()
                     i += 1
                     continue
@@ -878,11 +993,27 @@ class MainWindow(QMainWindow):
                             step_data.outputs.update(result)
                         else:
                             step_data.outputs['return'] = result
+                            try:
+                                for pn, pv in args.items():
+                                    if pv == result:
+                                        step_data.outputs[pn] = result
+                                # also map any predicted return names (parsed from source) to the returned value
+                                preds = self.func_return_names.get(module_name, {}).get(func_name, [])
+                                for pred in preds:
+                                    if pred not in step_data.outputs:
+                                        step_data.outputs[pred] = result
+                            except Exception:
+                                pass
                     output += f"{'成功' if result is None or result else '失败'}\n"
                 except Exception as e:
                     output += f"错误: {str(e)}\n"
 
                 self.output_text.setText(output)
+                # update watcher after executing a function step
+                try:
+                    self.update_watcher(runtime_vars)
+                except Exception:
+                    pass
                 QApplication.processEvents()
                 i += 1
 
@@ -904,11 +1035,71 @@ class MainWindow(QMainWindow):
         edit.setReadOnly(read_only)
         row_layout.addWidget(label)
         row_layout.addWidget(edit)
+
+        # reference insert button: opens a menu of previous steps/outputs to insert ${#N:key}
+        ref_btn = QPushButton("引用")
+        ref_btn.setToolTip("插入对前一步骤输出/参数的引用")
+        ref_btn.setFixedWidth(48)
+        row_layout.addWidget(ref_btn)
         self.input_params_layout.addLayout(row_layout)
         self.current_param_widgets[param_name] = edit
         print(f"[DEBUG] QLineEdit.text() after set: '{edit.text()}'")
         edit.repaint()
         edit.update()
+        # build and show the menu when ref_btn is clicked
+        def show_ref_menu():
+            menu = QMenu(self)
+            # gather steps
+            for i in range(self.sequence_list.count()):
+                it = self.sequence_list.item(i)
+                data = it.data(Qt.ItemDataRole.UserRole)
+                if not isinstance(data, StepObject):
+                    continue
+                title = it.text()
+                # collect candidate keys: outputs (prefer) then params
+                keys = []
+                # outputs first
+                for k in data.outputs.keys():
+                    keys.append((k, True))
+                # then params
+                for k in data.params.keys():
+                    if k not in data.outputs:
+                        keys.append((k, False))
+                # always offer predicted return names parsed from source (don't duplicate)
+                if data.type == 'function':
+                    preds = self.func_return_names.get(data.module, {}).get(data.function, [])
+                    for k in preds:
+                        if not any(k == ex for ex, _ in keys):
+                            keys.append((k, 'pred'))
+
+                if not keys:
+                    continue
+
+                # submenu per step
+                sub = QMenu(f"{i+1}: {title}", self)
+                for key, is_out in keys:
+                    suffix = ''
+                    if is_out is True or is_out == 'pred':
+                        # show as output in the menu; predicted outputs are marked with a tooltip
+                        suffix = ' (out)'
+                    action_text = f"{key}{suffix}"
+                    act = sub.addAction(action_text)
+                    if is_out == 'pred':
+                        act.setToolTip('预测输出（未运行）：运行后会填充真实值')
+                    def make_handler(step_index, k):
+                        return lambda checked=False: edit.insert(f"${{{'#'}{step_index}:{k}}}")
+                    act.triggered.connect(make_handler(i+1, key))
+                    # action already added to submenu
+                menu.addMenu(sub)
+
+            if menu.isEmpty():
+                a = menu.addAction("无可用引用")
+                a.setEnabled(False)
+
+            menu.exec(ref_btn.mapToGlobal(ref_btn.rect().bottomLeft()))
+
+        ref_btn.clicked.connect(show_ref_menu)
+
         return edit
         
     def clear_param_inputs(self):

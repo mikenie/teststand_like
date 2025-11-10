@@ -1,5 +1,6 @@
 import time
 
+
 def test_get_endpoint(timeout: float = 0.7, verbose: bool = True) -> bool:
     """测试GET端点
     
@@ -28,6 +29,7 @@ def test_post_endpoint(timeout: float = 0.8, verbose: bool = True) -> bool:
         bool: 测试是否通过
     """
     if verbose:
+        print(timeout)
         print("执行POST端点测试...")
     time.sleep(timeout)
     if verbose:
