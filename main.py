@@ -212,25 +212,39 @@ class MainWindow(QMainWindow):
         # 左侧区域
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
-        
+        # remove extra gaps in left area
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(0)
+
         # 函数树
         self.function_tree = DraggableTreeWidget()
         left_layout.addWidget(self.function_tree)
-        
+
         # 控制语句区域
         self.control_widget = ControlWidget()
         left_layout.addWidget(self.control_widget)
-        
+
         # 右侧区域（包含序列区和监视器，使用内部水平分割）
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
+        # remove extra gaps in right area
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
 
         # 创建序列区域（左）和监视器区域（右）的分割器
         seq_watcher_splitter = QSplitter(Qt.Orientation.Horizontal)
+        # make splitter handle less wide to visually remove gap
+        try:
+            seq_watcher_splitter.setHandleWidth(1)
+        except Exception:
+            pass
 
         # --- 序列区域（包含序列列表、控制按钮、步骤设置和输出）
         seq_area = QWidget()
         seq_layout = QVBoxLayout(seq_area)
+        # tighten sequence area layout
+        seq_layout.setContentsMargins(0, 0, 0, 0)
+        seq_layout.setSpacing(0)
 
         # 控制按钮栏（放在序列的左上角）
         control_bar = QHBoxLayout()
@@ -255,7 +269,7 @@ class MainWindow(QMainWindow):
         # --- 步骤设置区域 ---
         self.step_config_group = QWidget()
         step_layout = QVBoxLayout(self.step_config_group)
-        step_layout.setContentsMargins(5, 5, 5, 5)
+        step_layout.setContentsMargins(0, 0, 0, 0)
 
         self.current_param_widgets = {}  # 缓存当前参数控件
 
@@ -263,6 +277,9 @@ class MainWindow(QMainWindow):
 
         # 输入参数区
         self.input_params_layout = QVBoxLayout()
+        # remove spacing between input rows
+        self.input_params_layout.setSpacing(0)
+        self.input_params_layout.setContentsMargins(0, 0, 0, 0)
         self.input_params_widget = QWidget()
         self.input_params_widget.setLayout(self.input_params_layout)
         step_layout.addWidget(QLabel("输入参数:"))
@@ -286,7 +303,7 @@ class MainWindow(QMainWindow):
         # --- 监视器区域（右侧） ---
         watcher_widget = QWidget()
         watcher_layout = QVBoxLayout(watcher_widget)
-        watcher_layout.setContentsMargins(5, 5, 5, 5)
+        watcher_layout.setContentsMargins(0, 0, 0, 0)
         watcher_layout.addWidget(QLabel("变量监视器"))
         from PyQt6.QtWidgets import QTreeWidget, QTreeWidgetItem
         self.watcher_tree = QTreeWidget()
@@ -303,6 +320,11 @@ class MainWindow(QMainWindow):
         # 添加到分割器
         main_splitter.addWidget(left_widget)
         main_splitter.addWidget(right_widget)
+        # reduce splitter handle width and initial sizes to avoid large gap
+        try:
+            main_splitter.setHandleWidth(1)
+        except Exception:
+            pass
         main_splitter.setSizes([300, 700])
         
         # 连接信号
@@ -720,11 +742,37 @@ class MainWindow(QMainWindow):
         self.output_text.append(f"单步执行: 完成 {a} 个操作，下一索引 {ni}")
 
     def reset_executor(self):
+        """Reset execution state and clear runtime variables and per-step outputs.
+
+        This clears:
+          - self.exec_state (index and runtime vars)
+          - per-step outputs stored in StepObject.outputs
+          - any global_vars stored on the window
+        It does NOT clear step parameter values (用户输入的参数仍保留)。
+        """
+        # reset exec state
         self.exec_state = {'index': 0, 'vars': {}}
-        self.output_text.append("执行状态已重置")
-        # clear or set marker to start
-        self.mark_exec_index(self.exec_state['index'])
+
+        # clear outputs collected on each step so watcher no longer shows previous run values
+        for i in range(self.sequence_list.count()):
+            it = self.sequence_list.item(i)
+            data = it.data(Qt.ItemDataRole.UserRole)
+            if isinstance(data, StepObject):
+                try:
+                    data.outputs.clear()
+                except Exception:
+                    pass
+
+        # clear global runtime variables if present
+        try:
+            self.global_vars = {}
+        except Exception:
+            pass
+
+        # refresh watcher and execution marker
         self.update_watcher({})
+        self.mark_exec_index(self.exec_state['index'])
+        self.output_text.append("执行状态已重置；已清除运行时变量与步骤输出")
 
     def update_watcher(self, runtime_vars):
         """Refresh the watcher tree showing variables organized by sequence steps."""
@@ -1029,6 +1077,9 @@ class MainWindow(QMainWindow):
         """添加一行参数输入，并输出调试信息"""
         print(f"[DEBUG] 创建输入框: {param_name} = '{default_value}'")
         row_layout = QHBoxLayout()
+        # remove spacing/margins so input rows sit flush together
+        row_layout.setSpacing(0)
+        row_layout.setContentsMargins(0, 0, 0, 0)
         label = QLabel(f"{param_name}:")
         label.setFixedWidth(100)
         edit = QLineEdit(str(default_value))
@@ -1048,8 +1099,12 @@ class MainWindow(QMainWindow):
         edit.update()
         # build and show the menu when ref_btn is clicked
         def show_ref_menu():
+            """Show a flat reference menu listing each available step/key with the step index
+            so duplicate functions are unambiguous.
+            """
             menu = QMenu(self)
-            # gather steps
+            has_any = False
+            # gather steps and add actions directly so each action clearly shows the step index
             for i in range(self.sequence_list.count()):
                 it = self.sequence_list.item(i)
                 data = it.data(Qt.ItemDataRole.UserRole)
@@ -1058,14 +1113,11 @@ class MainWindow(QMainWindow):
                 title = it.text()
                 # collect candidate keys: outputs (prefer) then params
                 keys = []
-                # outputs first
                 for k in data.outputs.keys():
-                    keys.append((k, True))
-                # then params
+                    keys.append((k, 'out'))
                 for k in data.params.keys():
                     if k not in data.outputs:
-                        keys.append((k, False))
-                # always offer predicted return names parsed from source (don't duplicate)
+                        keys.append((k, 'param'))
                 if data.type == 'function':
                     preds = self.func_return_names.get(data.module, {}).get(data.function, [])
                     for k in preds:
@@ -1075,24 +1127,21 @@ class MainWindow(QMainWindow):
                 if not keys:
                     continue
 
-                # submenu per step
-                sub = QMenu(f"{i+1}: {title}", self)
-                for key, is_out in keys:
+                for key, kind in keys:
+                    # label includes step index and function/control title to avoid ambiguity
                     suffix = ''
-                    if is_out is True or is_out == 'pred':
-                        # show as output in the menu; predicted outputs are marked with a tooltip
+                    if kind == 'out' or kind == 'pred':
                         suffix = ' (out)'
-                    action_text = f"{key}{suffix}"
-                    act = sub.addAction(action_text)
-                    if is_out == 'pred':
+                    action_text = f"#{i+1} {title} :: {key}{suffix}"
+                    act = menu.addAction(action_text)
+                    if kind == 'pred':
                         act.setToolTip('预测输出（未运行）：运行后会填充真实值')
                     def make_handler(step_index, k):
                         return lambda checked=False: edit.insert(f"${{{'#'}{step_index}:{k}}}")
                     act.triggered.connect(make_handler(i+1, key))
-                    # action already added to submenu
-                menu.addMenu(sub)
+                    has_any = True
 
-            if menu.isEmpty():
+            if not has_any:
                 a = menu.addAction("无可用引用")
                 a.setEnabled(False)
 
