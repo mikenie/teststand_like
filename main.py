@@ -6,7 +6,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QTreeWidget, QTreeWidget
                              QWidget, QPushButton, QFileDialog, QTextEdit, QHBoxLayout,
                              QMessageBox, QAbstractItemView, QMenu, QLabel, QLineEdit)
 from PyQt6.QtCore import Qt, QMimeData, QDataStream, QIODevice, pyqtSignal, QByteArray, QPoint
-from PyQt6.QtGui import QDrag, QIcon
+from PyQt6.QtGui import QDrag, QIcon, QPixmap, QPainter, QColor
 import uuid
 
 # 定义MIME类型
@@ -19,9 +19,7 @@ class StepObject:
 
     Attributes:
         id: unique id
-        type: 'function' or 'control'
         module: module name (for functions)
-        function: function name (for functions)
         control: control token (for control items)
         params: dict of parameter name -> string value
     """
@@ -158,9 +156,48 @@ class MainWindow(QMainWindow):
         self.current_param_widgets = {}  # 缓存当前参数控件
         self.step_params_cache = {}      # 缓存每个步骤的参数值，key: "module.func", value: dict
         self.init_ui()
+        # initialize pass/fail icons
+        self.init_status_icons()
         self.load_test_functions()
         self.create_menu_bar()  # 确保方法已定义
 
+    def init_status_icons(self):
+        """Create small green/red round icons used to mark PASS/FAIL on steps."""
+        def make_icon(color_name):
+            size = 16
+            pix = QPixmap(size, size)
+            try:
+                pix.fill(Qt.GlobalColor.transparent)
+            except Exception:
+                # fallback to white then set mask
+                pix.fill(QColor(0, 0, 0, 0))
+            p = QPainter(pix)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            col = QColor(color_name)
+            p.setBrush(col)
+            p.setPen(QColor(0, 0, 0, 0))
+            p.drawEllipse(1, 1, size-3, size-3)
+            p.end()
+            return QIcon(pix)
+
+        self.icon_pass = make_icon('#2ecc71')  # green
+        self.icon_fail = make_icon('#e74c3c')  # red
+
+    def set_item_status(self, item, success: bool):
+        """Set the status icon for a QListWidgetItem. Pass True for PASS, False for FAIL.
+
+        If item is None or not a QListWidgetItem, the method is a no-op.
+        """
+        try:
+            if not item:
+                return
+            if success:
+                item.setIcon(self.icon_pass)
+            else:
+                item.setIcon(self.icon_fail)
+        except Exception:
+            # non-fatal: do not break execution on icon failures
+            pass
     def create_menu_bar(self):
         """创建菜单栏"""
         menu_bar = self.menuBar()
@@ -707,9 +744,19 @@ class MainWindow(QMainWindow):
                         except Exception:
                             # don't break execution on mapping issues
                             pass
-                self.output_text.append(f"{'成功' if result is None or result else '失败'}")
+                # determine success: None or truthy -> success
+                success = (result is None) or bool(result)
+                self.output_text.append(f"{'成功' if success else '失败'}")
+                try:
+                    self.set_item_status(item, success)
+                except Exception:
+                    pass
             except Exception as e:
                 self.output_text.append(f"错误: {str(e)}")
+                try:
+                    self.set_item_status(item, False)
+                except Exception:
+                    pass
 
             self.update_watcher(runtime_vars)
             actions += 1
@@ -760,6 +807,11 @@ class MainWindow(QMainWindow):
             if isinstance(data, StepObject):
                 try:
                     data.outputs.clear()
+                    # clear any status icon
+                    try:
+                        it.setIcon(QIcon())
+                    except Exception:
+                        pass
                 except Exception:
                     pass
 
@@ -1052,9 +1104,19 @@ class MainWindow(QMainWindow):
                                         step_data.outputs[pred] = result
                             except Exception:
                                 pass
-                    output += f"{'成功' if result is None or result else '失败'}\n"
+                    # determine success and set icon
+                    success = (result is None) or bool(result)
+                    output += f"{'成功' if success else '失败'}\n"
+                    try:
+                        self.set_item_status(item, success)
+                    except Exception:
+                        pass
                 except Exception as e:
                     output += f"错误: {str(e)}\n"
+                    try:
+                        self.set_item_status(item, False)
+                    except Exception:
+                        pass
 
                 self.output_text.setText(output)
                 # update watcher after executing a function step
