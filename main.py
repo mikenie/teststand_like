@@ -13,6 +13,18 @@ import uuid
 MIME_TYPE = "application/x-test-item"
 
 
+class BreakLoop(Exception):
+    """Internal exception to signal breaking out of the nearest enclosing for-loop.
+
+    Carries the number of actions consumed inside the inner block so callers
+    can correctly accumulate action counts during step-run.
+    """
+    def __init__(self, actions=0, runtime_vars=None):
+        super().__init__()
+        self.actions = actions
+        self.runtime_vars = runtime_vars
+
+
 class StepObject:
     """Represent a step in the sequence. Holds parameters as attributes so each
     dropped item owns its own param state.
@@ -112,7 +124,7 @@ class DroppableListWidget(QListWidget):
             event.acceptProposedAction()
         elif event.mimeData().hasText():
             text = event.mimeData().text()
-            if text in ["if", "for", "end"]:
+            if text in ["if", "for", "end", "break"]:
                 item = QListWidgetItem(text)
                 step = StepObject(type_="control", control=text)
                 item.setData(Qt.ItemDataRole.UserRole, step)
@@ -571,8 +583,21 @@ class MainWindow(QMainWindow):
         sequence_text = "当前测试序列:\n"
         for i in range(self.sequence_list.count()):
             item = self.sequence_list.item(i)
-            sequence_text += f"{i+1}. {item.text()}\n"
+            # item.text() may include an exec marker; strip any marker suffix before building the output
+            base = item.text().split('  ')[0]
+            sequence_text += f"{i+1}. {base}\n"
         self.output_text.setText(sequence_text)
+        # refresh visible numbering and exec marker
+        try:
+            idx = None
+            if hasattr(self, 'exec_state') and self.exec_state is not None:
+                idx = self.exec_state.get('index')
+            self.mark_exec_index(idx)
+        except Exception:
+            try:
+                self.mark_exec_index(None)
+            except Exception:
+                pass
 
     # Executor helpers and state for step execution
     def _safe_eval(self, expr, local_vars=None):
@@ -657,16 +682,29 @@ class MainWindow(QMainWindow):
                     for val in iterator:
                         new_vars = dict(runtime_vars)
                         new_vars[varname] = val
-                        ni, nv, a = self._run_block(i+1, match-1, new_vars, None if max_actions is None else (max_actions - actions))
-                        actions += a
-                        if max_actions is not None and actions >= max_actions:
-                            # compute where to resume: if we stopped inside inner block, set index accordingly
-                            return (i, nv, actions)
+                        try:
+                            ni, nv, a = self._run_block(i+1, match-1, new_vars, None if max_actions is None else (max_actions - actions))
+                            actions += a
+                        except BreakLoop as ex:
+                            # inner block requested a break: consume its reported actions and stop iterating
+                            actions += ex.actions
+                            runtime_vars = ex.runtime_vars or runtime_vars
+                            # if we've hit the max actions for a step-run, resume after the for-block
+                            if max_actions is not None and actions >= max_actions:
+                                return (match+1, runtime_vars, actions)
+                            break
                     i = match + 1
                     continue
                 else:
                     i += 1
                     continue
+            elif ctrl == 'break':
+                # signal to the enclosing for-loop to stop
+                actions += 1
+                self.output_text.append("BREAK")
+                self.update_watcher(runtime_vars)
+                # raise to inform the caller (the parent for-handler) to stop iterating
+                raise BreakLoop(actions=1, runtime_vars=runtime_vars)
             elif ctrl == 'end':
                 i += 1
                 continue
@@ -769,8 +807,8 @@ class MainWindow(QMainWindow):
     def step_run(self):
         """Execute a single action (control evaluation or a function call)."""
         if not hasattr(self, 'exec_state') or self.exec_state is None:
-            # initialize
-            self.exec_state = {'index': 0, 'vars': {}}
+            # initialize execution state with a loop stack for single-stepping through for-loops
+            self.exec_state = {'index': 0, 'vars': {}, 'loop_stack': []}
         start = self.exec_state['index']
         end = self.sequence_list.count() - 1
         if start > end:
@@ -778,7 +816,146 @@ class MainWindow(QMainWindow):
             return
         # show marker at current position before executing
         self.mark_exec_index(start)
-        ni, nv, a = self._run_block(start, end, dict(self.exec_state['vars']), max_actions=1)
+        # Helper: locate innermost loop that contains index 'start'
+        def find_enclosing_loop(start_idx):
+            ls = self.exec_state.get('loop_stack', [])
+            for entry in reversed(ls):
+                if entry['start'] < start_idx <= entry['end']:
+                    return entry
+            return None
+
+        item = self.sequence_list.item(start)
+        step_data = item.data(Qt.ItemDataRole.UserRole)
+
+        # If the current item is a for-header and we're not already inside that for-loop,
+        # initialize loop state and set the first loop variable value so the next step
+        # will execute the inner block with the loop var present.
+        if isinstance(step_data, StepObject) and step_data.type == 'control' and step_data.control == 'for':
+            # avoid double-initializing if we already have a loop stack entry for this start
+            existing = None
+            for e in self.exec_state.get('loop_stack', []):
+                if e['start'] == start:
+                    existing = e
+                    break
+
+            match = self.find_matching_end(start)
+            iterable_raw = step_data.params.get('iterable', '')
+            varname = step_data.params.get('var', '_loop')
+            iterable_val = self.resolve_references(iterable_raw, dict(self.exec_state['vars']))
+            # normalize iterable same as full-run/_run_block
+            if isinstance(iterable_val, int):
+                iterator = list(range(iterable_val))
+            elif isinstance(iterable_val, (list, tuple)):
+                iterator = list(iterable_val)
+            else:
+                try:
+                    iterator = list(self._safe_eval(str(iterable_val), dict(self.exec_state['vars'])))
+                except Exception:
+                    iterator = []
+
+            # consume the 'for' header as this step
+            if not iterator:
+                # empty iterator: skip the whole for-block
+                ni = match + 1 if match != -1 else start + 1
+                self.exec_state['index'] = ni
+                self.output_text.append(f"单步执行: 空迭代对象，跳过 for-block，下一索引 {ni}")
+                if self.exec_state['index'] <= end:
+                    self.mark_exec_index(self.exec_state['index'])
+                else:
+                    self.mark_exec_index(None)
+                return
+
+            # initialize loop stack entry
+            if existing is None:
+                entry = {'start': start, 'end': match, 'iterator': iterator, 'pos': 0, 'var': varname}
+                self.exec_state.setdefault('loop_stack', []).append(entry)
+            else:
+                entry = existing
+
+            # set loop var to first element and move to first inner index
+            new_vars = dict(self.exec_state['vars'])
+            new_vars[varname] = entry['iterator'][entry['pos']]
+            self.exec_state['vars'] = new_vars
+            self.exec_state['index'] = start + 1 if match != -1 else start + 1
+            # update UI
+            self.mark_exec_index(self.exec_state['index'])
+            self.output_text.append(f"进入 for: 设 {varname} = {entry['iterator'][entry['pos']]}，下一索引 {self.exec_state['index']}")
+            return
+
+        # If we're inside a loop body, run one action within that loop and handle iteration bookkeeping
+        enclosing = find_enclosing_loop(start)
+        if enclosing is not None:
+            try:
+                ni, nv, a = self._run_block(start, enclosing['end'], dict(self.exec_state['vars']), max_actions=1)
+            except BreakLoop as ex:
+                # break breaks out of this enclosing loop: remove this loop entry and resume after it
+                # consume the break's runtime_vars if provided
+                try:
+                    self.exec_state['vars'] = ex.runtime_vars or dict(self.exec_state['vars'])
+                except Exception:
+                    pass
+                # pop the loop entry
+                try:
+                    self.exec_state['loop_stack'].remove(enclosing)
+                except Exception:
+                    pass
+                ni = enclosing['end'] + 1
+                self.exec_state['index'] = ni
+                # update marker/UI
+                if self.exec_state['index'] <= end:
+                    self.mark_exec_index(self.exec_state['index'])
+                else:
+                    self.mark_exec_index(None)
+                self.output_text.append(f"在循环内遇到 break，跳至索引 {ni}")
+                return
+
+            # update runtime vars
+            self.exec_state['vars'] = nv
+
+            # if inner block finished (ni passed the end), advance iterator
+            if ni > enclosing['end']:
+                enclosing['pos'] += 1
+                if enclosing['pos'] < len(enclosing['iterator']):
+                    # set next loop var and point back to first inner item
+                    self.exec_state['vars'][enclosing['var']] = enclosing['iterator'][enclosing['pos']]
+                    self.exec_state['index'] = enclosing['start'] + 1
+                    self.mark_exec_index(self.exec_state['index'])
+                    self.output_text.append(f"循环下次迭代: 设 {enclosing['var']} = {enclosing['iterator'][enclosing['pos']]}，下一索引 {self.exec_state['index']}")
+                    return
+                else:
+                    # loop fully completed: pop and resume after end
+                    try:
+                        self.exec_state['loop_stack'].remove(enclosing)
+                    except Exception:
+                        pass
+                    self.exec_state['index'] = enclosing['end'] + 1
+                    if self.exec_state['index'] <= end:
+                        self.mark_exec_index(self.exec_state['index'])
+                    else:
+                        self.mark_exec_index(None)
+                    self.output_text.append(f"循环完成，下一索引 {self.exec_state['index']}")
+                    return
+            else:
+                # still inside inner block; resume at returned index
+                self.exec_state['index'] = ni
+                if self.exec_state['index'] <= end:
+                    self.mark_exec_index(self.exec_state['index'])
+                else:
+                    self.mark_exec_index(None)
+                self.output_text.append(f"单步执行: 完成 {a} 个操作，下一索引 {ni}")
+                return
+
+        # default: not a for header nor inside a loop - just execute one action normally
+        try:
+            ni, nv, a = self._run_block(start, end, dict(self.exec_state['vars']), max_actions=1)
+        except BreakLoop as ex:
+            # break encountered with no enclosing for-block in this call chain;
+            # treat it as one consumed action and advance past the current index
+            ni = start + 1
+            nv = ex.runtime_vars or dict(self.exec_state['vars'])
+            a = ex.actions
+        else:
+            nv = nv
         self.exec_state['index'] = ni
         self.exec_state['vars'] = nv
         # update marker to new position (or clear if finished)
@@ -797,8 +974,8 @@ class MainWindow(QMainWindow):
           - any global_vars stored on the window
         It does NOT clear step parameter values (用户输入的参数仍保留)。
         """
-        # reset exec state
-        self.exec_state = {'index': 0, 'vars': {}}
+        # reset exec state (include loop_stack for single-step loop handling)
+        self.exec_state = {'index': 0, 'vars': {}, 'loop_stack': []}
 
         # clear outputs collected on each step so watcher no longer shows previous run values
         for i in range(self.sequence_list.count()):
@@ -892,6 +1069,7 @@ class MainWindow(QMainWindow):
         Args:
             idx (int|None): index to mark, or None to clear all markers.
         """
+        # Rebuild each item's displayed text to include a leading index and an optional exec marker.
         for i in range(self.sequence_list.count()):
             item = self.sequence_list.item(i)
             data = item.data(Qt.ItemDataRole.UserRole)
@@ -902,13 +1080,13 @@ class MainWindow(QMainWindow):
                 else:
                     base = data.control
             else:
-                # fallback: remove any previous arrow suffix
+                # fallback: strip any previous arrow suffix
                 base = item.text().split('  ')[0]
 
+            display = f"{i+1}. {base}"
             if idx is not None and i == idx:
-                item.setText(f"{base}  <-")
-            else:
-                item.setText(base)
+                display = f"{display}  <-"
+            item.setText(display)
         
     def run_sequence(self):
         """运行测试序列"""
@@ -1008,12 +1186,27 @@ class MainWindow(QMainWindow):
                         for val in iterator:
                             new_vars = dict(runtime_vars)
                             new_vars[varname] = val
-                            run_block(i+1, match-1, new_vars)
+                            try:
+                                run_block(i+1, match-1, new_vars)
+                            except BreakLoop:
+                                # break out of the iterator loop and continue after the matching end
+                                break
                         i = match + 1
                         continue
                     else:
                         i += 1
                         continue
+                elif ctrl == 'break':
+                    # break encountered during full run: stop the innermost for loop
+                    output += "BREAK\n"
+                    self.output_text.setText(output)
+                    try:
+                        self.update_watcher(runtime_vars)
+                    except Exception:
+                        pass
+                    QApplication.processEvents()
+                    # raise to inform caller to break the iterator
+                    raise BreakLoop(actions=1, runtime_vars=runtime_vars)
                 elif ctrl == 'end':
                     # should be handled by find_matching_end logic; just advance
                     i += 1
@@ -1130,6 +1323,10 @@ class MainWindow(QMainWindow):
         try:
             run_block(0, self.sequence_list.count()-1, {})
             output += "测试序列执行完成。\n"
+            self.output_text.setText(output)
+        except BreakLoop:
+            # break outside of any for-block: ignore and finish run
+            output += "遇到 break（未在循环内），已忽略。\n"
             self.output_text.setText(output)
         except Exception as e:
             output += f"执行过程中发生错误: {str(e)}\n"

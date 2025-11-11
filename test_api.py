@@ -16,7 +16,7 @@ def test_get_endpoint(timeout: float = 0.7, verbose: bool = True) -> bool:
     time.sleep(timeout)
     if verbose:
         print("GET端点测试通过")
-    return timeout
+    return True
 
 def test_post_endpoint(timeout: float = 0.8, verbose: bool = True) -> bool:
     """测试POST端点
