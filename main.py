@@ -486,18 +486,20 @@ class MainWindow(QMainWindow):
         # reset parsed return names
         self.func_return_names = {}
         
-        # 查找当前目录下的Python文件
-        current_dir = os.getcwd()
-        for file in os.listdir(current_dir):
-            if file.endswith(".py") and file.startswith("test_") and file != "test_functions.py":
-                module_name = file[:-3]  # 移除.py扩展名
+        # 查找 Testcase/ 目录（优先），否则回退到当前目录
+        base_dir = os.path.join(os.getcwd(), 'Testcase') if os.path.isdir(os.path.join(os.getcwd(), 'Testcase')) else os.getcwd()
+        for fname in os.listdir(base_dir):
+            if fname.endswith('.py') and fname.startswith('test_') and fname != 'test_functions.py':
+                file_path = os.path.join(base_dir, fname)
+                module_name = os.path.splitext(os.path.basename(file_path))[0]
                 try:
-                    spec = importlib.util.spec_from_file_location(module_name, file)
+                    spec = importlib.util.spec_from_file_location(module_name, file_path)
                     module = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(module)
                     # attempt to parse source to find return variable names or dict keys
                     try:
-                        src = open(file, 'r', encoding='utf-8').read()
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            src = f.read()
                         import ast
                         tree = ast.parse(src)
                         func_returns = {}
@@ -522,7 +524,7 @@ class MainWindow(QMainWindow):
                     except Exception:
                         # ignore parsing errors
                         pass
-                    
+
                     # 获取模块中的函数
                     functions = []
                     for name in dir(module):
@@ -532,7 +534,7 @@ class MainWindow(QMainWindow):
                             if module_name not in self.test_functions:
                                 self.test_functions[module_name] = {}
                             self.test_functions[module_name][name] = getattr(module, name)
-                    
+
                     # 添加到函数树
                     if functions:
                         module_item = QTreeWidgetItem([module_name])
